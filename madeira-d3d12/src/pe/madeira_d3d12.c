@@ -36,7 +36,13 @@
 #include "madeira_d3d12_stubs.h"
 #include "madeira_ir_abi.h"
 
-#define MADEIRA_D3D12_BUILD "madeira-d3d12 M2 " __DATE__ " " __TIME__
+/* MADEIRA_D3D12_BUILD_TAG (-D on the compiler line) marks a test build in the
+ * log's "device created" line, so a drop-in d3d12.dll can be told from the
+ * bundled one. */
+#ifndef MADEIRA_D3D12_BUILD_TAG
+#define MADEIRA_D3D12_BUILD_TAG ""
+#endif
+#define MADEIRA_D3D12_BUILD "madeira-d3d12 M2 " __DATE__ " " __TIME__ MADEIRA_D3D12_BUILD_TAG
 
 /* ---- diagnostics ---------------------------------------------------------
  * Routed through OutputDebugStringA so it lands in the same log as everything

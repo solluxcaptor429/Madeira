@@ -146,6 +146,7 @@ research/remote-metal/host/rmetald
 build/madeira-d3d12/out/
 build/madeira-d3d12/out-ios/
 build/madeira-d3d12/out-pe/
+build/madeira-d3d12/out-win/
 research/remote-metal/host/rmetald.*
 
 # Apple Metal Shader Converter dynamic library: TRACKED (decision 2026-09-16).
