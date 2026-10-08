@@ -1918,6 +1918,11 @@ done:
 
 /* winemetal's unix dispatch table entry. Signature matches every other slot. */
 extern "C" int madeira_ir_convert(void *args) {
-    madeira_ir_convert_impl((struct madeira_ir_convert_args *)args);
+    struct madeira_ir_convert_args *a = (struct madeira_ir_convert_args *)args;
+    if (!a) return 0;
+    /* Every path returns its status, but not every failure path also stores it
+     * (an SM50Initialize failure returned BAD_DXIL with ret_status still OK, so
+     * the PE side took an empty library for a success). */
+    a->ret_status = (uint32_t)madeira_ir_convert_impl(a);
     return 0;   /* the call itself succeeded; ret_status carries the outcome */
 }

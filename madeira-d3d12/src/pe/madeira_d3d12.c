@@ -1245,11 +1245,11 @@ static HRESULT STDMETHODCALLTYPE list_Close(ID3D12GraphicsCommandList *This) {
     if (l->alloc) InterlockedDecrement(&l->alloc->recording);
     return S_OK;
 }
+static void STDMETHODCALLTYPE list_SetPipelineState(ID3D12GraphicsCommandList *This, ID3D12PipelineState *pso);
 static HRESULT STDMETHODCALLTYPE list_Reset(ID3D12GraphicsCommandList *This,
                                             ID3D12CommandAllocator *allocator,
                                             ID3D12PipelineState *pso) {
     struct mad_list *l = (struct mad_list *)This;
-    (void)pso;
     if (!l->closed) return E_FAIL;         /* reset while recording */
     if (!allocator) return E_INVALIDARG;
     if (l->inflight) mad_list_wait_idle(l);   /* ml1120: the submission worker still replays it */
@@ -1265,6 +1265,9 @@ static HRESULT STDMETHODCALLTYPE list_Reset(ID3D12GraphicsCommandList *This,
     l->nused = 0;
     l->ncdata = 0;
     mad_list_rings_rewind(l);   /* ml1061: only reuses chunks the GPU has finished with */
+    /* The initial state is the list's first SetPipelineState: an app that passes
+     * it here never sets it again, and every draw would be skipped. */
+    if (pso) list_SetPipelineState(This, pso);
     return S_OK;
 }
 static D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE list_GetType(ID3D12GraphicsCommandList *This) {
@@ -3860,9 +3863,11 @@ tess_go:
         MAD_APPEND(&c_vp);
     }
     if (e->has_sc) {
-        /* Metal refuses a scissor outside the attachment; clamp to it. */
-        UINT tw = e->enc_nrt && e->enc_rt[0] ? e->enc_rt[0]->width : (e->enc_depth ? e->enc_depth->width : 0);
-        UINT th = e->enc_nrt && e->enc_rt[0] ? e->enc_rt[0]->height : (e->enc_depth ? e->enc_depth->height : 0);
+        /* Metal refuses a scissor outside the attachment; clamp to it. The pass's
+         * own area comes first: it is the bound mip's size, and the only size an
+         * attachment-less pass has. */
+        UINT tw = e->enc_w ? e->enc_w : e->enc_nrt && e->enc_rt[0] ? e->enc_rt[0]->width : (e->enc_depth ? e->enc_depth->width : 0);
+        UINT th = e->enc_h ? e->enc_h : e->enc_nrt && e->enc_rt[0] ? e->enc_rt[0]->height : (e->enc_depth ? e->enc_depth->height : 0);
         LONG x0 = e->sc.left < 0 ? 0 : e->sc.left, y0 = e->sc.top < 0 ? 0 : e->sc.top;
         LONG x1 = e->sc.right, y1 = e->sc.bottom;
         if (tw && x1 > (LONG)tw) x1 = (LONG)tw;
@@ -3872,6 +3877,11 @@ tess_go:
             c_sc.scissor_rect.x = (UINT64)x0; c_sc.scissor_rect.y = (UINT64)y0;
             c_sc.scissor_rect.width = (UINT64)(x1 - x0); c_sc.scissor_rect.height = (UINT64)(y1 - y0);
             MAD_APPEND(&c_sc);
+        } else {
+            /* An empty scissor culls every pixel in D3D12. Without a scissor
+             * command the draw would run under the previous draw's scissor. The
+             * pass is already begun, so its clears still happen. */
+            return;
         }
     }
     memset(sb, 0, sizeof sb);
@@ -5975,7 +5985,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandAllocator(ID3D12Device *Thi
 static HRESULT STDMETHODCALLTYPE device_CreateCommandList(ID3D12Device *This, UINT node,
         D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator *allocator,
         ID3D12PipelineState *pso, REFIID riid, void **out) {
-    (void)This; (void)node; (void)pso;
+    (void)This; (void)node;
     if (!out || !allocator) return E_INVALIDARG;
     if (!mad_list_type_ok(type)) return E_NOTIMPL;
     if (((struct mad_alloc *)allocator)->type != type) return E_INVALIDARG;
@@ -5988,6 +5998,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandList(ID3D12Device *This, UI
     ID3D12CommandAllocator_AddRef(allocator);
     InterlockedIncrement(&l->alloc->recording);   /* lists are created recording */
     l->recorded_generation = l->alloc->generation;
+    if (pso) list_SetPipelineState((ID3D12GraphicsCommandList *)l, pso);   /* as in list_Reset */
     HRESULT hr = list_QI((ID3D12GraphicsCommandList *)l, riid, out);
     list_Release((ID3D12GraphicsCommandList *)l);
     return hr;
@@ -5997,7 +6008,10 @@ static HRESULT STDMETHODCALLTYPE device_CreateFence(ID3D12Device *This, UINT64 i
         D3D12_FENCE_FLAGS flags, REFIID riid, void **out) {
     (void)This;
     if (!out) return E_INVALIDARG;
-    if (flags != D3D12_FENCE_FLAG_NONE) return E_NOTIMPL;
+    /* SHARED only matters across processes and NON_MONITORED only changes how a
+     * driver watches the value; in one process both behave as a plain fence.
+     * Cross-adapter sharing has no meaning here. */
+    if (flags & ~(D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_NON_MONITORED)) return E_NOTIMPL;
     struct mad_fence *f = calloc(1, sizeof *f);
     if (!f) return E_OUTOFMEMORY;
     f->vtbl = &g_fence_vtbl; f->refs = 1; f->iid = &IID_ID3D12Fence; f->name = "Fence";
@@ -9195,7 +9209,9 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
     }
     MadeiraIRConvert(&a);
     if (a.ret_status != MADEIRA_IR_BUFFER_TOO_SMALL && a.ret_status != MADEIRA_IR_OK) {
-        const unsigned char *b = (const unsigned char *)dxil;
+        unsigned char head[16] = {0};   /* a shorter blob logs zeros, not what follows it */
+        const unsigned char *b = head;
+        if (dxil) memcpy(head, dxil, dxil_len < sizeof head ? (size_t)dxil_len : sizeof head);
         d3d12_log("[madeira-d3d12] %s conversion failed: %s (%s backend, code %u); %llu bytes, head "
                   "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
                   tag, mad_ir_status_name(a.ret_status),
@@ -9287,7 +9303,11 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
     }
     free(buf2);
 
-    if (vsin_n) *vsin_n = a.ret_vs_input_count < vsin_cap ? a.ret_vs_input_count : vsin_cap;
+    /* The DXBC backend counts its inputs but never fills vsin (its vertex stage
+     * fetches vertices itself, ml1105): the caller would match semantics against
+     * whatever the stack held. Only the DXIL converter's reflection is real. */
+    if (vsin_n) *vsin_n = a.ret_backend == MADEIRA_IR_BACKEND_AIRCONV ? 0
+                        : a.ret_vs_input_count < vsin_cap ? a.ret_vs_input_count : vsin_cap;
     if (nlocs) *nlocs = a.ret_loc_count < MAD_LOC_MAX ? a.ret_loc_count : MAD_LOC_MAX;
     if (tg_out) { tg_out[0] = a.ret_tg_size[0]; tg_out[1] = a.ret_tg_size[1]; tg_out[2] = a.ret_tg_size[2]; }
     if (o && o->dtess) {   /* DXIL tessellation */
@@ -10163,7 +10183,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device
             p->vb_stride[i] = vd.layouts[6 + i].stride;
             p->vb_mask |= 1u << i;
         }
-    } else if (desc->InputLayout.NumElements) {
+    } else if (desc->InputLayout.NumElements && p->backend != MADEIRA_IR_BACKEND_AIRCONV) {
         d3d12_log("[madeira-d3d12] input layout has %u elements but the vertex shader reported no inputs\n",
                   desc->InputLayout.NumElements);
     }
@@ -10589,7 +10609,7 @@ static void STDMETHODCALLTYPE list_SetComputeRoot32BitConstants(ID3D12GraphicsCo
         UINT index, UINT n, const void *data, UINT dst_offset) {
     struct mad_list *l = (struct mad_list *)This;
     struct mad_cmd *c;
-    if (!n || !data || index >= MAD_ROOT_PARAM_MAX || dst_offset + n > 64) return;
+    if (!n || !data || index >= MAD_ROOT_PARAM_MAX || n > 64 || dst_offset > 64 - n) return;   /* no UINT wrap */
     if (!mad_grow((void **)&l->cdata, &l->cdcap, l->ncdata + n, sizeof *l->cdata)) return;
     c = mad_list_push(l, MC_CROOT_CONST);
     if (!c) return;
@@ -10894,7 +10914,7 @@ static void STDMETHODCALLTYPE list_SetGraphicsRoot32BitConstants(ID3D12GraphicsC
         UINT index, UINT n, const void *data, UINT dst_offset) {
     struct mad_list *l = (struct mad_list *)This;
     struct mad_cmd *c;
-    if (!n || !data || index >= MAD_ROOT_PARAM_MAX || dst_offset + n > 64) return;
+    if (!n || !data || index >= MAD_ROOT_PARAM_MAX || n > 64 || dst_offset > 64 - n) return;   /* no UINT wrap */
     if (!mad_grow((void **)&l->cdata, &l->cdcap, l->ncdata + n, sizeof *l->cdata)) return;
     c = mad_list_push(l, MC_ROOT_CONST);
     if (!c) return;
@@ -11057,6 +11077,22 @@ static void STDMETHODCALLTYPE list_ExecuteIndirect(ID3D12GraphicsCommandList *Th
     if (count_buf && said_count++ < 1)
         d3d12_log("[madeira-d3d12] ExecuteIndirect: count buffers are not honoured yet; issuing all %u records\n", max_count);
     if (max_count > 8192) { if (said_big++ < 4) d3d12_log("[madeira-d3d12] ExecuteIndirect: %u records capped at 8192\n", max_count); max_count = 8192; }
+    {
+        /* Every record issued must lie inside the argument buffer: the count buffer
+         * is not read, so all max_count records are, and a capacity larger than
+         * the buffer would have Metal read past its end. */
+        UINT64 argsize = kind == MC_DRAW_INDIRECT ? 16 : kind == MC_DRAW_INDEXED_INDIRECT ? 20 : 12;
+        UINT64 stride = cs->desc.ByteStride ? cs->desc.ByteStride : argsize;
+        UINT64 size = ((struct mad_resource *)args)->size, fit;
+        fit = args_off <= size && size - args_off >= argsize ? (size - args_off - argsize) / stride + 1 : 0;
+        if (fit < max_count) {
+            static unsigned said_fit;
+            if (said_fit++ < 4) d3d12_log("[madeira-d3d12] ExecuteIndirect: %u records at offset %llu do not fit a %llu-byte buffer; issuing %llu\n",
+                                          max_count, (unsigned long long)args_off, (unsigned long long)size, (unsigned long long)fit);
+            if (!fit) return;
+            max_count = (UINT)fit;
+        }
+    }
     c = mad_list_push((struct mad_list *)This, kind);
     if (!c) return;
     c->u.ind.args = (struct mad_resource *)args; c->u.ind.off = args_off; c->u.ind.count = max_count;
