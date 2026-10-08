@@ -8,7 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Bump to rebuild every dependency once.
-VERSION=1
+VERSION=2
 
 tree() { git rev-parse "HEAD:$1" 2>/dev/null || echo "absent:$1"; }
 sub() { git ls-tree HEAD "$1" | awk '{print $3}'; }

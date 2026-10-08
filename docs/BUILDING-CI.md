@@ -1,7 +1,7 @@
 # Building the IPA with GitHub Actions
 
 `.github/workflows/ios-build.yml` builds an **unsigned** Madeira IPA on
-GitHub's hosted `macos-15` runners, so no Mac is needed. Public repositories
+GitHub's hosted `macos-26` runners, so no Mac is needed. Public repositories
 get these runners for free. The workflow is adapted from the CI of the
 Axoled-Student/Madeira fork, which was itself adapted from
 arjunyerevan95-dot/Madeira, and updated for the current tree.
