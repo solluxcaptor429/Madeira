@@ -1,0 +1,141 @@
+name: Build Madeira IPA
+# Builds an unsigned Madeira IPA on GitHub's hosted macOS runners (docs/BUILDING-CI.md).
+# The four native dependencies are built in parallel and cached on exactly the
+# inputs their builds read (scripts/ci-cache-key.sh), so a run after an app-only
+# or D3D12-only change reuses them and only assembles the app.
+on:
+  push:
+    branches: [windows-d3d12-build, 'ci/**']
+    paths-ignore: ['docs/**', '**/*.md', 'research/**', 'tests/**']
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Xcode configuration (docs/BUILDING.md - Release builds have crashed the guest)
+        type: choice
+        options: [Debug, Release]
+        default: Debug
+permissions:
+  contents: read
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  HOMEBREW_NO_INSTALL_CLEANUP: '1'
+
+jobs:
+  dependency:
+    name: Build ${{ matrix.component }}
+    runs-on: macos-15
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [fex, llvm, wine, i386]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache key
+        id: key
+        run: bash scripts/ci-cache-key.sh '${{ matrix.component }}' | tee -a "$GITHUB_OUTPUT"
+      - name: Restore ${{ matrix.component }}
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ci-output/${{ matrix.component }}-ios.tar.gz
+            ci-output/${{ matrix.component }}-sha256.txt
+            ci-output/${{ matrix.component }}-source-commit.txt
+          key: ${{ steps.key.outputs.key }}
+      - name: Install build tools
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          brew install cmake ninja
+          case '${{ matrix.component }}' in
+            wine) brew install bison llvm gnutls pkg-config ;;
+            i386) brew install bison meson pkg-config ;;
+          esac
+      - name: Build ${{ matrix.component }}
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ci-output
+          set -o pipefail
+          bash scripts/ci-build-dependency.sh '${{ matrix.component }}' 2>&1 | tee 'ci-output/${{ matrix.component }}.log'
+      - name: Keep build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.component }}
+          path: |
+            ci-output/*.log
+            build/gnutls-ios/obj/*.log
+            build/ffmpeg/obj/*.log
+            build/ntdll-unix/obj/*.err
+            build/win32u-unix/obj/*.err
+            build/wineserver/obj/err-*.txt
+            wine/build-macos/config.log
+            wine/build-i386/config.log
+            wine/build-i386/madeira-i386-build.log
+            dxmt/build-pe-i386/meson-logs/meson-log.txt
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Hand the ${{ matrix.component }} archive to the app job
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-${{ matrix.component }}
+          path: |
+            ci-output/${{ matrix.component }}-ios.tar.gz
+            ci-output/${{ matrix.component }}-sha256.txt
+            ci-output/${{ matrix.component }}-source-commit.txt
+          if-no-files-found: error
+          retention-days: 3
+
+  app:
+    name: Build the IPA
+    needs: dependency
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ios-*
+          path: build-inputs
+      - name: Arrange the dependency archives
+        run: |
+          # download-artifact puts each artifact in build-inputs/<artifact name>.
+          for c in fex llvm wine i386; do mv "build-inputs/ios-$c" "build-inputs/$c"; done
+          ls -R build-inputs
+      - name: Build and package
+        env:
+          MADEIRA_CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
+        run: |
+          mkdir -p ci-output
+          set -o pipefail
+          bash scripts/ci-build-app.sh 2>&1 | tee ci-output/app-build.log
+      - name: Upload the IPA
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-iPhone
+          path: |
+            ci-output/*.ipa
+            ci-output/d3d12.dll
+            ci-output/SHA256SUMS
+            ci-output/BUILD-NOTES.txt
+            ci-output/Madeira.entitlements
+            ci-output/fetch-vcruntime.md
+            ci-output/source-commit.txt
+            ci-output/submodule-commits.txt
+          if-no-files-found: error
+          retention-days: 30
+      - name: Keep build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-app
+          path: |
+            ci-output/*.log
+            ci-output/linked-libraries.txt
+            build/dxmt-ios/obj/*.err
+          if-no-files-found: ignore
+          retention-days: 14
