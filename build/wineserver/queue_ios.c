@@ -4414,7 +4414,16 @@ void ios_dump_stuck_waits(void)
 
         for (h = 0; h < e->count && h < 8; h++)
         {
-            struct object *obj = get_handle_obj( f.found->process, e->handles[h], 0, NULL );
+            struct object *obj;
+            /* Pseudo-handles (GetCurrentProcess/Thread and friends, and the 0x7fffffff
+             * current-process alias) resolve through `current`, which is NULL in this
+             * timer-driven dump: get_handle_obj would take the whole app down. */
+            if (e->handles[h] >= 0xfffffff0 || e->handles[h] == 0x7fffffff)
+            {
+                fprintf( stderr, "[srv-stuck]   h[%d]=%08x -> pseudo-handle\n", h, e->handles[h] );
+                continue;
+            }
+            obj = get_handle_obj( f.found->process, e->handles[h], 0, NULL );
             if (!obj)
             {
                 clear_error();

@@ -531,6 +531,25 @@ static void *ios_stale_va_scanner( void *arg )
 static __thread void *ios_my_trampoline = NULL;
 static __thread int ios_my_slot = -1;
 
+/* segv_handler's SEGV LOOP breaker: this thread's last faulting pc and address,
+ * and how often that pair has repeated with no fault handled in between. It was
+ * one process-wide pc counter checked before the fault handlers, so a memcpy
+ * crossing five write-watched or guard pages (each fault handled) had its 5th
+ * store skipped and x0 overwritten. */
+static __thread uintptr_t ios_segv_last_pc, ios_segv_last_addr;
+static __thread int ios_segv_repeat;
+
+/* The thread's own trampoline slot goes back to the pool when its host thread
+ * exits (the key's value is slot + 1, so slot 0 is not the "no value" NULL). */
+static pthread_key_t ios_slot_key;
+static pthread_once_t ios_slot_key_once = PTHREAD_ONCE_INIT;
+static void ios_slot_release( void *value )
+{
+    extern void ios_jit_free_trampoline_slot(int slot);
+    ios_jit_free_trampoline_slot( (int)(intptr_t)value - 1 );
+}
+static void ios_slot_key_init( void ) { pthread_key_create( &ios_slot_key, ios_slot_release ); }
+
 /* Thread registry: maps Mach thread port → TEB + trampoline.
  *
  * ml384: was 64. Steam runs register 90+ threads; entries past the cap were
@@ -10223,17 +10242,16 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
 #ifdef WINE_IOS
     {
-        static uintptr_t last_fault_pc = 0;
-        static int fault_repeat_count = 0;
+        uintptr_t this_addr = (uintptr_t)siginfo->si_addr;
         uintptr_t this_pc = PC_sig(context);
-        if (this_pc == last_fault_pc)
+        if (this_pc == ios_segv_last_pc && this_addr == ios_segv_last_addr)
         {
-            fault_repeat_count++;
+            ios_segv_repeat++;
             static unsigned long loop_storm;
-            if (fault_repeat_count == 3 && ios_sig_storm_gate( &loop_storm ))
+            if (ios_segv_repeat == 3 && ios_sig_storm_gate( &loop_storm ))
             {
                 ERR("SEGV LOOP DETECTED: pc=%p addr=%p repeated %d times, dumping TEB+PEB\n",
-                    (void*)this_pc, siginfo->si_addr, fault_repeat_count);
+                    (void*)this_pc, siginfo->si_addr, ios_segv_repeat);
                 /* Dump TEB */
                 if (ios_teb_for_signals)
                 {
@@ -10278,23 +10296,23 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                     }
                 }
             }
-            if (fault_repeat_count >= 5)
+            if (ios_segv_repeat >= 5)
             {
                 ERR("SEGV LOOP FATAL: pc=%p addr=%p after %d repeats, forcing thread exit\n",
-                    (void*)this_pc, siginfo->si_addr, fault_repeat_count);
+                    (void*)this_pc, siginfo->si_addr, ios_segv_repeat);
                 /* Skip the faulting instruction and set return value to indicate failure */
                 PC_sig(context) = PC_sig(context) + 4;
                 REGn_sig(0, context) = 0xDEAD0001;
                 ios_fixup_x18_for_return( context );
-                last_fault_pc = 0;
-                fault_repeat_count = 0;
+                ios_segv_last_pc = 0;
+                ios_segv_repeat = 0;
                 return;
             }
         }
         else
         {
-            last_fault_pc = this_pc;
-            fault_repeat_count = 1;
+            ios_segv_last_pc = this_pc; ios_segv_last_addr = this_addr;
+            ios_segv_repeat = 1;
         }
     }
 #endif
@@ -10320,6 +10338,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         if (!(sg_rx && sg_pc >= sg_rx && sg_pc < sg_rx + sg_sz) &&
             ios_subfloor_service( context, siginfo->si_addr, "segv", ios_jit_current_peb() ))
         {
+            ios_segv_repeat = 0; ios_segv_last_pc = 0;   /* handled: not a loop */
             PC_sig(context) = PC_sig(context) + 4;
             ios_fixup_x18_for_return( context );
             return;
@@ -10330,6 +10349,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     {
 #ifdef WINE_IOS
         ERR("virtual_handle_fault HANDLED addr=%p\n", siginfo->si_addr);
+        ios_segv_repeat = 0; ios_segv_last_pc = 0;   /* handled: not a loop */
         ios_fixup_x18_for_return( context );
 #endif
         return;
@@ -10337,6 +10357,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     if (handle_syscall_fault( context, &rec ))
     {
 #ifdef WINE_IOS
+        ios_segv_repeat = 0; ios_segv_last_pc = 0;   /* handled: not a loop */
         ios_fixup_x18_for_return( context );
 #endif
         return;
@@ -13532,11 +13553,20 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
 
     /* Allocate per-thread trampoline slot in JIT pool */
     {
-        extern int ios_jit_alloc_trampoline_slot(void);
+        extern int ios_jit_alloc_trampoline_slot_ex(int *granted);
         extern void ios_jit_set_teb_slot(int slot, uintptr_t teb);
         extern void *ios_jit_get_trampoline(int slot);
+        int granted = 0;
 
-        ios_my_slot = ios_jit_alloc_trampoline_slot();
+        if (ios_my_slot < 0)   /* once per thread: a second init keeps its slot */
+        {
+            ios_my_slot = ios_jit_alloc_trampoline_slot_ex( &granted );
+            if (granted)
+            {
+                pthread_once( &ios_slot_key_once, ios_slot_key_init );
+                pthread_setspecific( ios_slot_key, (void *)(intptr_t)(ios_my_slot + 1) );
+            }
+        }
         ios_jit_set_teb_slot(ios_my_slot, (uintptr_t)teb);
         ios_my_trampoline = ios_jit_get_trampoline(ios_my_slot);
         ERR("init_syscall_frame: allocated trampoline slot %d, tramp=%p, teb=%p\n",

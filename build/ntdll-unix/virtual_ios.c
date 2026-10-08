@@ -2883,13 +2883,32 @@ int ios_fast_footprint = 0;                    /* ml670: set when d3d11 loads */
 void *ios_jit_teb_trampoline = NULL;  /* RX address of slot 0 trampoline (offset 8) */
 #define IOS_JIT_TRAMPOLINE_SIZE 16    /* Bytes per trampoline slot */
 #define IOS_JIT_MAX_SLOTS 256         /* Max threads with trampolines */
-static volatile int32_t ios_jit_next_slot = 0;  /* Next slot to allocate */
+/* Slots in use, one bit each. A slot goes back when its thread exits
+ * (ios_jit_free_trampoline_slot, from a thread-exit destructor in
+ * signal_arm64_ios.c): with a lifetime counter, every thread after the 256th
+ * shared slot 0, so the x18 restore gave it the newest such thread's TEB. */
+static volatile uint32_t ios_jit_slot_used[IOS_JIT_MAX_SLOTS / 32];
 
-/* Allocate a per-thread trampoline slot. Returns slot index (0-based). */
-int ios_jit_alloc_trampoline_slot(void)
+/* Allocate a per-thread trampoline slot: the lowest free one, so the first
+ * thread still gets slot 0. Returns slot index (0-based). *granted is 1 when
+ * the slot is this caller's own, to return with ios_jit_free_trampoline_slot,
+ * and 0 for the shared slot-0 fallback, which must not be returned. */
+int ios_jit_alloc_trampoline_slot_ex(int *granted)
 {
-    int slot = __sync_fetch_and_add(&ios_jit_next_slot, 1);
-    if (slot >= IOS_JIT_MAX_SLOTS) return 0;  /* fallback to slot 0 */
+    int slot = -1, i;
+    if (granted) *granted = 0;
+    for (i = 0; i < IOS_JIT_MAX_SLOTS && slot < 0; i++)
+    {
+        uint32_t bit = 1u << (i & 31);
+        if (!(__atomic_fetch_or(&ios_jit_slot_used[i >> 5], bit, __ATOMIC_ACQ_REL) & bit)) slot = i;
+    }
+    if (slot < 0)
+    {
+        static int said;
+        if (!said++) ERR("all %d JIT trampoline slots in use: sharing slot 0\n", IOS_JIT_MAX_SLOTS);
+        return 0;  /* fallback to slot 0 */
+    }
+    if (granted) *granted = 1;
 
     /* Write trampoline code to this slot's RW view */
     if (ios_jit_rw_base_global)
@@ -2902,6 +2921,18 @@ int ios_jit_alloc_trampoline_slot(void)
             sys_icache_invalidate((char *)ios_jit_rx_base_global + slot * 16 + 8, 8);
     }
     return slot;
+}
+
+int ios_jit_alloc_trampoline_slot(void)
+{
+    return ios_jit_alloc_trampoline_slot_ex(NULL);
+}
+
+/* Return a slot from ios_jit_alloc_trampoline_slot_ex once its thread has exited. */
+void ios_jit_free_trampoline_slot(int slot)
+{
+    if (slot >= 0 && slot < IOS_JIT_MAX_SLOTS)
+        __atomic_fetch_and(&ios_jit_slot_used[slot >> 5], ~(1u << (slot & 31)), __ATOMIC_RELEASE);
 }
 
 /* Write TEB address to a specific trampoline slot */
@@ -16079,12 +16110,13 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
     struct timeval dc_t0, dc_t1, dc_t2, dc_t3;
     int dc_sampled = 0;
 
-    if (!size)
-    {
-        size = view->size;
-        host_end = host_start + view->size;
-    }
-    else host_end = ROUND_ADDR( base + size, host_page_mask );
+    /* Size 0 (only at view->base, NtFreeVirtualMemory checks) is the whole view.
+     * Views are 4 KB-granular, so the end is rounded down to a host page like
+     * any other size: an unrounded end handed anon_mmap_fixed a size its assert
+     * refuses (VirtualFree(p, 0, MEM_DECOMMIT) on a 0x3000-byte allocation
+     * aborted the app). The tail below the rounded end is zeroed further down. */
+    if (!size) size = view->size;
+    host_end = ROUND_ADDR( base + size, host_page_mask );
 
     /* ml610 [dc-census] BEFORE sample. Large ranges only (the 16MB callret
      * stacks and the LookupCache clears — the small-decommit flood would drown
