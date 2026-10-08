@@ -24,6 +24,7 @@
 #import <Metal/Metal.h>
 #import <os/log.h>
 #include <stdarg.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <mach/mach.h>
@@ -678,15 +679,57 @@ static struct {
     pthread_mutex_t lock;
 } g_input_q = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
+/* A mouse event that only moves the pointer (no button, no wheel). */
+static int winios_ev_is_move(const winios_input_event_t *e) {
+    return e->type == WINIOS_EV_MOUSE && (e->flags & MOUSEEVENTF_MOVE)
+        && !(e->flags & ~(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE));
+}
+
+static int winios_sat_add(int a, int b) {
+    long long s = (long long)a + b;
+    return s > INT_MAX ? INT_MAX : s < INT_MIN ? INT_MIN : (int)s;
+}
+
+/* Never blocks the UI thread on a Wine event drain. A pointer move is merged
+ * into a move still queued at the end (an absolute one takes the new position,
+ * relative deltas add up), since a 1 kHz mouse fills the ring in a quarter of a
+ * second whenever the drain stalls. When the ring is still full, a key or button
+ * event evicts the oldest queued move rather than being lost: a lost key-up or
+ * button-up leaves the key held in Windows. Only a ring of nothing but key and
+ * button events drops its oldest entry. */
 static void winios_q_push_ev(unsigned int type, int x, int y, unsigned int flags, unsigned int data) {
+    winios_input_event_t ev = {type, x, y, flags, data};
     pthread_mutex_lock(&g_input_q.lock);
-    unsigned int next = (g_input_q.head + 1) % WINIOS_RING_SIZE;
-    if (next != g_input_q.tail) {
-        g_input_q.buf[g_input_q.head] = (winios_input_event_t){type, x, y, flags, data};
-        g_input_q.head = next;
+    if (winios_ev_is_move(&ev) && g_input_q.head != g_input_q.tail) {
+        winios_input_event_t *last = &g_input_q.buf[(g_input_q.head + WINIOS_RING_SIZE - 1) % WINIOS_RING_SIZE];
+        if (winios_ev_is_move(last) && (last->flags & MOUSEEVENTF_ABSOLUTE) == (flags & MOUSEEVENTF_ABSOLUTE)) {
+            if (flags & MOUSEEVENTF_ABSOLUTE) { last->x = x; last->y = y; }
+            else { last->x = winios_sat_add(last->x, x); last->y = winios_sat_add(last->y, y); }
+            pthread_mutex_unlock(&g_input_q.lock);
+            return;
+        }
     }
-    /* If buffer is full we drop the oldest event by simply not advancing —
-     * better than blocking the UI thread on a Wine event drain. */
+    unsigned int next = (g_input_q.head + 1) % WINIOS_RING_SIZE;
+    if (next == g_input_q.tail) {
+        if (winios_ev_is_move(&ev)) {           /* full: a move is the one to lose */
+            pthread_mutex_unlock(&g_input_q.lock);
+            return;
+        }
+        unsigned int i = g_input_q.tail;
+        while (i != g_input_q.head && !winios_ev_is_move(&g_input_q.buf[i])) i = (i + 1) % WINIOS_RING_SIZE;
+        if (i == g_input_q.head) {
+            g_input_q.tail = (g_input_q.tail + 1) % WINIOS_RING_SIZE;
+        } else {                                /* close the gap the evicted move leaves */
+            for (unsigned int j = (i + 1) % WINIOS_RING_SIZE; j != g_input_q.head; j = (j + 1) % WINIOS_RING_SIZE) {
+                g_input_q.buf[i] = g_input_q.buf[j];
+                i = j;
+            }
+            g_input_q.head = i;
+        }
+        next = (g_input_q.head + 1) % WINIOS_RING_SIZE;
+    }
+    g_input_q.buf[g_input_q.head] = ev;
+    g_input_q.head = next;
     pthread_mutex_unlock(&g_input_q.lock);
 }
 

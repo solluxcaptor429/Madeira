@@ -270,7 +270,10 @@ while (!detached) {
             let addr = x0;
             if (x0 === 0n && x1 !== 0n) {
                 let allocResp = send_command(`_M${x1.toString(16)},rx`);
-                if (allocResp && allocResp.length > 0) {
+                // An address is hex, and at least 9 digits: iOS reserves the low
+                // 4 GB (__PAGEZERO). Anything else, such as debugserver's "E53"
+                // error reply, is a failed allocation, not an address.
+                if (allocResp && /^[0-9a-fA-F]{9,16}$/.test(allocResp)) {
                     addr = BigInt(`0x${allocResp}`);
                     ulog(`Madeira JIT: allocated at 0x${addr.toString(16)}`);
                 }

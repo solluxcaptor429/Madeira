@@ -445,6 +445,10 @@ struct LibraryEntry: Codable, Identifiable {
               launchWindowsPath.utf8.count < 1024, (steamWorkingWindowsPath?.utf8.count ?? 0) < 512 else {
             throw LibraryError.message("The saved launch profile contains invalid display or argument values.")
         }
+        // WineProcessBridge copies the program's path into 512-byte buffers.
+        guard launchWindowsPath.utf8.count < 500 else {
+            throw LibraryError.message("The program's path is too long. Move the game to a shorter folder on drive C:.")
+        }
         var quoted = false, inToken = false, tokens = 0
         for character in launchArguments {
             if character == "\"" { quoted.toggle() }

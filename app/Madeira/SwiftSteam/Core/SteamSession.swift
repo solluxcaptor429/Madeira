@@ -566,8 +566,10 @@ class SteamSession {
                 do {
                     try await connection.send(data)
                 } catch {
-                    pendingJobs.removeValue(forKey: jobID)
-                    continuation.resume(throwing: error)
+                    // disconnect() or the timeout may already have resumed it.
+                    if pendingJobs.removeValue(forKey: jobID) != nil {
+                        continuation.resume(throwing: error)
+                    }
                 }
             }
 

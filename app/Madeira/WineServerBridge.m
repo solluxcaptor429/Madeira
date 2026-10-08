@@ -47,6 +47,9 @@ extern void wineserver_log_set_file(const char *path);
 // Set NLS directory for wineserver (defined in unicode_ios.c)
 extern void wineserver_set_nls_dir(const char *path);
 
+static pthread_t g_wineserver_thread;
+static volatile int g_wineserver_running = 0;
+
 // Override wineserver's fatal_error to use logging and pthread_exit instead of exit(1)
 void fatal_error( const char *err, ... ) {
     va_list args;
@@ -56,7 +59,11 @@ void fatal_error( const char *err, ... ) {
     va_end(args);
     wine_log_msg_impl("[Wine] FATAL: %s", buf);
     // Don't call exit(1) — that kills the whole app.
-    // Instead, terminate just this thread.
+    // Instead, terminate just this thread. pthread_exit skips the thread
+    // function's own "running = 0", so clear it here: otherwise
+    // wineserver_is_running() reports a dead server for the rest of the run
+    // and every later launch is refused.
+    g_wineserver_running = 0;
     pthread_exit(NULL);
 }
 
@@ -67,8 +74,6 @@ extern int debug_level;
 // Stop flag checked by wineserver event loop (fd_ios.c)
 volatile int g_wineserver_should_stop = 0;
 
-static pthread_t g_wineserver_thread;
-static volatile int g_wineserver_running = 0;
 static char *g_prefix_path = NULL;
 
 static void *wineserver_thread_func(void *arg) {
@@ -155,6 +160,9 @@ int wineserver_start(const char *prefix_path) {
         extern int wineserver_ready;
         __atomic_store_n(&wineserver_ready, 0, __ATOMIC_RELEASE);
     }
+    /* wineserver_stop() set this for the previous session; left set, the next
+     * server's event loop would exit on its first pass. */
+    g_wineserver_should_stop = 0;
     g_wineserver_running = 1;
 
     /* 2026-07-04 perf: the wineserver thread used to be created at LOWERED

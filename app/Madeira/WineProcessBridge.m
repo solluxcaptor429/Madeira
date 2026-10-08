@@ -421,15 +421,23 @@ void madeira_seed_prefix_if_needed(const char *prefix_path) {
 
         [fm createDirectoryAtPath:prefix withIntermediateDirectories:YES attributes:nil error:nil];
 
-        if (![fm fileExistsAtPath:stamp]) {
+        /* .update-timestamp is an early entry of the template, so it exists long
+         * before an extraction finishes. .madeira-seeding marks one in progress and
+         * goes only when it succeeds: an extraction the app did not finish (killed,
+         * jetsam, a full disk) runs again at the next start instead of leaving a
+         * prefix without drive_c/windows for good. Extraction overwrites files. */
+        NSString *seeding = [prefix stringByAppendingPathComponent:@".madeira-seeding"];
+        if (![fm fileExistsAtPath:stamp] || [fm fileExistsAtPath:seeding]) {
             NSString *tgz = [[NSBundle mainBundle] pathForResource:@"prefix-template" ofType:@"tar.gz"];
             if (!tgz) {
                 LOG("prefix-template.tar.gz missing from bundle!");
             } else {
                 LOG("Seeding prefix from %{public}s", tgz.UTF8String);
+                [fm createFileAtPath:seeding contents:nil attributes:nil];
                 if (madeira_extract_prefix_tgz(tgz.UTF8String, prefix_path) != 0) {
-                    LOG("prefix extraction FAILED");
+                    LOG("prefix extraction FAILED (retried at the next start)");
                 } else {
+                    [fm removeItemAtPath:seeding error:nil];
                     LOG("prefix seeded to %{public}s", prefix_path);
                 }
             }
@@ -1600,10 +1608,14 @@ static void *wine_process_thread(void *arg) {
             const char *drive_c = "drive_c";
             const char *after_drive = madeira_exe + 3; /* skip "C:\" */
             char *last_sep = strrchr(madeira_exe, '\\');
-            if (last_sep && last_sep > madeira_exe + 3) {
+            char windir[512];
+            if (last_sep && last_sep > madeira_exe + 3 && (size_t)(last_sep - after_drive) >= sizeof(windir)) {
+                /* LibraryEntry.validate keeps launch paths shorter; a longer folder
+                 * would overrun windir. Stay in the default folder instead. */
+                dprintf(STDERR_FILENO, "[WineProc] program folder longer than %zu bytes: not changing to it\n", sizeof(windir) - 1);
+            } else if (last_sep && last_sep > madeira_exe + 3) {
                 /* Get "Program Files\Thumper" from "C:\Program Files\Thumper\X.exe" */
                 size_t dir_len = (size_t)(last_sep - after_drive);
-                char windir[512];
                 memcpy(windir, after_drive, dir_len);
                 windir[dir_len] = 0;
                 /* Translate backslashes to forward slashes */
@@ -1615,7 +1627,7 @@ static void *wine_process_thread(void *arg) {
                 /* Also set the iOS-specific override so env_ios.c's
                  * get_initial_directory bypasses unix_to_nt_file_name (which
                  * fails to resolve drive_c via dosdevices on iOS). */
-                char wine_cwd[768];
+                char wine_cwd[768] = "";
                 /* Strip trailing exe name from madeira_exe to get the dir part */
                 {
                     const char *exe = madeira_exe;
